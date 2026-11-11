@@ -1,4 +1,5 @@
 # brew tap berrysekk/agents-cli https://github.com/Berrysekk/Agents-cli
+# brew trust berrysekk/agents-cli   (Homebrew 7 loads a tap only once you trust it)
 # brew install agents-cli
 class AgentsCli < Formula
   desc "Live tree of the running Claude Code sessions and their subagents"

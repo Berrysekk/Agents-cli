@@ -29,6 +29,7 @@ curl -fsSL https://raw.githubusercontent.com/Berrysekk/Agents-cli/main/install.s
 
 ```sh
 brew tap berrysekk/agents-cli https://github.com/Berrysekk/Agents-cli
+brew trust berrysekk/agents-cli
 brew install agents-cli
 ```
 
