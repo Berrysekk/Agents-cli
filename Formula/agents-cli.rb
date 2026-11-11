@@ -5,6 +5,7 @@ class AgentsCli < Formula
   desc "Live tree of the running Claude Code sessions and their subagents"
   homepage "https://github.com/Berrysekk/Agents-cli"
   url "https://github.com/Berrysekk/Agents-cli/archive/refs/tags/v1.0.0.tar.gz"
+  license "MIT"
   sha256 "73c3f37ac24aa3fe78573ef42b0d3318f2afbba3c5db0f8b8ad4ea923bc2e342"
 
   def install

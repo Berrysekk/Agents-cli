@@ -103,4 +103,4 @@ or `brew uninstall agents-cli`. The config file, if you made one, is `~/.config/
 
 ---
 
-<sub>Not affiliated with or endorsed by Anthropic.</sub>
+<sub>MIT license. Not affiliated with or endorsed by Anthropic.</sub>
