@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""agents — every running Claude Code session and its subagents, as one live tree.
+
+  agents            live view (q quits)
+  agents --once     one frame
+  agents --json     the same data, for scripts
+  agents config     the groups in effect, as the JSON the config file takes
+  agents update     install the latest version
+  agents version    · help · selftest
+
+Read-only: it only reads the files Claude Code keeps about its own sessions.
+"""
+import glob, json, os, re, select, shutil, sys, tempfile, time, unicodedata
+
+VERSION = "1.0.0"
+REPO = "Berrysekk/Agents-cli"
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "agents", "config.json")
+# shortcut: meta.json's `finished` is not written reliably, so a subagent counts as running only while its
+# transcript was written in the last 5 min; one sitting in a longer tool call drops out until it writes again.
+FRESH = 300
+# Claude's own colours: its orange while it works, the blue of its permission prompt while it waits for you.
+ORANGE, GREY = "38;5;173", "38;5;240"
+STATES = {"waiting": ("waiting", "1;38;5;147"), "busy": ("working", ORANGE), "idle": ("idle", "38;5;245")}
+ORDER = {"waiting": 0, "busy": 1, "idle": 2}
+color = False
+
+
+def paint(code, s):
+    return f"\x1b[{code}m{s}\x1b[0m" if color else s
+
+
+def width(s):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def fit(s, w):
+    """Cuts or pads to exactly w columns. Names come from files: nothing in them may reach the terminal as a control code."""
+    s = "".join(c if c.isprintable() else "�" for c in str(s))
+    if width(s) > w:
+        while s and width(s) > w - 1:
+            s = s[:-1]
+        s += "…"
+    return s + " " * (w - width(s))
+
+
+def ago(seconds):
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{int(seconds // size)} {unit}"
+    return f"{int(max(0, seconds))} s"
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def place(cwd):
+    repo, mark, tree = cwd.partition("/.claude/worktrees/")
+    return f"{os.path.basename(repo)} ⎇ {tree}" if mark else os.path.basename(cwd.rstrip("/")) or "/"
+
+
+def groups():
+    """The Claude config directories to watch: the config file's, else every one in the home folder."""
+    try:
+        with open(CONFIG) as f:
+            return [(g["name"], os.path.expanduser(g["dir"])) for g in json.load(f)["groups"]]
+    except FileNotFoundError:
+        pass
+    except (ValueError, KeyError, TypeError) as e:
+        sys.exit(f"agents: {CONFIG} is not a list of groups ({e!r}). Fix it, or delete it to go back to the defaults.")
+    home = os.path.expanduser("~")
+    found = [os.environ.get("CLAUDE_CONFIG_DIR"), f"{home}/.claude", *sorted(glob.glob(f"{home}/.claude-*"))]
+    dirs = dict.fromkeys(os.path.realpath(d) for d in found if d and os.path.isdir(f"{d}/sessions"))
+    # ~/.claude is "Claude", ~/.claude-work is "work".
+    return [(os.path.basename(d).removeprefix(".claude-").replace(".claude", "Claude"), d) for d in dirs]
+
+
+def subagents(root, session, now):
+    """The running subagents of one session, nested by parentAgentId."""
+    found = {}
+    for meta in glob.glob(f"{root}/projects/*/{session}/subagents/**/agent-*.meta.json", recursive=True):
+        try:
+            with open(meta) as f:
+                m = json.load(f)
+            if m.get("finished") or now - os.path.getmtime(meta[: -len(".meta.json")] + ".jsonl") > FRESH:
+                continue
+            name, about = m.get("name"), m.get("description") or ""
+            found[os.path.basename(meta)[len("agent-") : -len(".meta.json")]] = {
+                "name": f"{name} · {about}" if name and about else name or about or "subagent",
+                "type": m.get("agentType", ""), "since": os.path.getmtime(meta),
+                "parent": m.get("parentAgentId"), "kids": []}
+        except (OSError, ValueError):
+            continue
+    top = []
+    for agent in sorted(found.values(), key=lambda a: a["since"]):
+        (found[agent["parent"]]["kids"] if agent["parent"] in found else top).append(agent)
+    return top
+
+
+def load(roots=None, now=None):
+    now = now or time.time()
+    result = []
+    for label, root in roots or groups():
+        sessions = []
+        for path in glob.glob(f"{root}/sessions/*.json"):
+            try:
+                with open(path) as f:
+                    s = json.load(f)
+                if not alive(int(s["pid"])):
+                    continue
+                sessions.append({
+                    "name": s.get("name") or s["sessionId"][:8], "status": s.get("status", "busy"),
+                    "note": s.get("waitingFor", ""), "where": place(s.get("cwd", "")), "pid": s["pid"],
+                    "since": (s.get("statusUpdatedAt") or s.get("startedAt") or now * 1000) / 1000,
+                    "kids": subagents(root, s["sessionId"], now)})
+            except (OSError, ValueError, KeyError):
+                continue
+        sessions.sort(key=lambda s: (ORDER.get(s["status"], 1), s["since"]))
+        if sessions:
+            result.append({"group": label, "sessions": sessions})
+    return result
+
+
+def count(kids):
+    return sum(1 + count(k["kids"]) for k in kids)
+
+
+def render(found, now, cols):
+    wide = max(60, min(cols, 120)) - 2
+    inner, right, mid = wide - 4, 20, 26
+    sessions = [s for g in found for s in g["sessions"]]
+    tally = [f"{len(sessions)} session{'s' * (len(sessions) != 1)}"] + [
+        f"{n} {STATES[k][0]}" for k in STATES if (n := sum(s["status"] == k for s in sessions))]
+    if subs := sum(count(s["kids"]) for s in sessions):
+        tally.append(f"{subs} subagent{'s' * (subs != 1)}")
+    lines = [f" {paint('1;' + ORANGE, 'Agents')}  {paint('2', ' · '.join(tally))}"]
+
+    def row(lead, lead_width, left, middle, end):
+        text = fit(left, inner - lead_width - mid - right - 4) + "  " + paint("2", fit(middle, mid)) + "  " + fit(end, right).rstrip().rjust(right)
+        lines.append(f" {paint(GREY, '│')} {lead}{text} {paint(GREY, '│')}")
+
+    def branch(kids, indent):
+        for i, kid in enumerate(kids):
+            last = i == len(kids) - 1
+            lead = paint(GREY, indent + ("└─ " if last else "├─ ")) + paint(ORANGE, "●") + " "
+            row(lead, len(indent) + 5, kid["name"], kid["type"], ago(now - kid["since"]))
+            branch(kid["kids"], indent + ("   " if last else "│  "))
+
+    for n, group in enumerate(found):
+        title = group["group"]
+        rule = paint(GREY, "─" * max(1, wide - 5 - width(title)))
+        lines.append(f" {paint(GREY, '├─' if n else '╭─')} {paint(('' if n else '1;') + ORANGE, title)} {rule}{paint(GREY, '┤' if n else '╮')}")
+        for s in group["sessions"]:
+            word, code = STATES.get(s["status"], (s["status"], ORANGE))
+            end = ago(now - s["since"])
+            if s["note"]:  # a long reason is cut, the time never
+                end = fit(s["note"], right - len(end) - 3).rstrip() + " · " + end
+            row(paint(code, "● " + fit(word, 8)) + " ", 11, s["name"], s["where"], end)
+            branch(s["kids"], "  ")
+    if not found:
+        lines.append(f"  {paint('2', 'No Claude is running.')}")
+    else:
+        lines.append(f" {paint(GREY, '╰' + '─' * (wide - 2) + '╯')}")
+    return lines
+
+
+def live():
+    import termios, tty
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    sys.stdout.write("\x1b[?1049h\x1b[?25l")
+    try:
+        tty.setcbreak(fd)
+        while True:
+            size = shutil.get_terminal_size()
+            lines = render(load(), time.time(), size.columns)
+            hint = f"  {paint('1', 'q')} {paint('2', 'quit')}   {paint('2', 'refreshes every 2 s')}"
+            room = size.lines - 2
+            if len(lines) > room:  # shortcut: no scrolling, the frame is cut to the window; add paging if it bites
+                lines = lines[: room - 1] + [f"  {paint('2', f'… and {len(lines) - room + 1} more lines')}"]
+            sys.stdout.write("\x1b[H" + "".join(l + "\x1b[K\n" for l in lines + ["", hint]) + "\x1b[J")
+            sys.stdout.flush()
+            if select.select([fd], [], [], 2)[0] and os.read(fd, 8)[:1] in (b"q", b"Q", b"\x1b", b"\x03"):
+                return
+    except KeyboardInterrupt:
+        pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        sys.stdout.write("\x1b[?25h\x1b[?1049l")
+
+
+def update():
+    import urllib.request
+    me = os.path.realpath(__file__)
+    if "/Cellar/" in me:
+        sys.exit("Installed with Homebrew: brew upgrade agents-cli")
+    try:
+        with urllib.request.urlopen(f"https://raw.githubusercontent.com/{REPO}/main/agents", timeout=20) as r:
+            new = r.read()
+    except OSError as e:
+        sys.exit(f"agents: github.com cannot be reached ({e}).")
+    latest = re.search(rb'^VERSION = "(\d+(?:\.\d+)*)"$', new, re.M)
+    if not new.startswith(b"#!/usr/bin/env python3") or not latest:
+        sys.exit("agents: the download is not agents (cut short?). Try again.")
+    latest = latest[1].decode()
+    if [int(x) for x in latest.split(".")] <= [int(x) for x in VERSION.split(".")]:
+        print(f"agents {VERSION} is the latest version.")
+        return
+    try:
+        with open(me + ".new", "wb") as f:
+            f.write(new)
+        os.chmod(me + ".new", 0o755)
+        os.replace(me + ".new", me)
+    except OSError as e:
+        sys.exit(f"agents: {me} could not be replaced ({e}).")
+    print(f"Updated agents from {VERSION} to {latest}.")
+
+
+def selftest():
+    now = time.time()
+    with tempfile.TemporaryDirectory() as root:
+        os.makedirs(f"{root}/sessions")
+        sub = f"{root}/projects/-x/sid-live/subagents"
+        os.makedirs(f"{sub}/workflows/run1")
+        for pid, sid, status in ((os.getpid(), "sid-live", "busy"), (2 ** 22 + 12345, "sid-dead", "idle")):
+            with open(f"{root}/sessions/{pid}.json", "w") as f:
+                json.dump({"pid": pid, "sessionId": sid, "name": sid, "status": status,
+                           "cwd": "/r/Repo/.claude/worktrees/wt", "statusUpdatedAt": (now - 120) * 1000}, f)
+        agents = (("agent-a1", {"description": "parent"}, 0), ("workflows/run1/agent-a2", {"description": "child", "parentAgentId": "a1"}, 0),
+                  ("agent-a3", {"description": "done", "finished": True}, 0), ("agent-a4", {"description": "stale"}, FRESH + 60))
+        for name, meta, age in agents:
+            with open(f"{sub}/{name}.meta.json", "w") as f:
+                json.dump(meta, f)
+            open(f"{sub}/{name}.jsonl", "w").close()
+            os.utime(f"{sub}/{name}.jsonl", (now - age, now - age))
+        got = load([("T", root)], now)
+    assert [s["name"] for s in got[0]["sessions"]] == ["sid-live"], got
+    session = got[0]["sessions"][0]
+    assert session["where"] == "Repo ⎇ wt", session
+    assert [k["name"] for k in session["kids"]] == ["parent"], session
+    assert [k["name"] for k in session["kids"][0]["kids"]] == ["child"], session
+    frame = render(got, now, 100)
+    assert len({width(l) for l in frame[1:]}) == 1, [(width(l), l) for l in frame]
+    assert any("└─ ● child" in l for l in frame), frame
+    assert fit("abcdef", 4) == "abc…" and ago(7300) == "2 h"
+    assert fit("a\x1b[2J\nb", 8) == "a�[2J�b ", fit("a\x1b[2J\nb", 8)
+    print("ok")
+
+
+def main():
+    global color
+    if len(sys.argv) > 2:
+        sys.exit("agents: one command at a time (try `agents help`)")
+    arg = sys.argv[1] if len(sys.argv) == 2 else ""
+    if arg in ("help", "--help", "-h"):
+        print(__doc__.strip())
+    elif arg in ("version", "--version", "-v"):
+        print(f"agents {VERSION}")
+    elif arg == "selftest":
+        selftest()
+    elif arg == "update":
+        update()
+    elif arg == "config":
+        home = os.path.expanduser("~")
+        shown = [{"name": n, "dir": "~" + d[len(home):] if d.startswith(home + "/") else d} for n, d in groups()]
+        print(json.dumps({"groups": shown}, ensure_ascii=False, indent=2))
+        print(f"\nSave it as {CONFIG} to rename, reorder or drop groups.", file=sys.stderr)
+    elif arg == "--json":
+        json.dump(load(), sys.stdout, ensure_ascii=False, indent=1)
+        print()
+    elif arg in ("", "--once"):
+        color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+        if arg or not (sys.stdout.isatty() and sys.stdin.isatty()):
+            print("\n".join(render(load(), time.time(), shutil.get_terminal_size().columns)))
+        else:
+            live()
+    else:
+        sys.exit(f"agents: unknown command {arg} (try `agents help`)")
+
+
+if __name__ == "__main__":
+    main()
